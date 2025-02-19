@@ -4,32 +4,15 @@ from matplotlib import pyplot as plt
 from scipy.linalg import sqrtm
 
 import pickle
-
+import emcee
 import time
 import tqdm
-
-# import os
-
-# os.environ["OMP_NUM_THREADS"] = "1"
-
-import multiprocess as mp
-mp.set_start_method('spawn', force=True)
-
+import multiprocessing as mp
+from multiprocessing import Pool
 import os
-# Ensure friendly behavior of OpenMP and multiprocessing
 os.environ["OMP_NUM_THREADS"] = "1"
 mp.set_start_method('spawn', force=True)
-
-import pip
-
-import multiprocessing
-from multiprocessing import Pool
-
 import copy
-
-import getdist
-from getdist import plots, MCSamples
-
 from cosmoprimo.fiducial import Planck2018FullFlatLCDM
 from cosmoprimo.fiducial import DESI
 from cosmoprimo import *
@@ -67,9 +50,6 @@ def log_like(the, obs, cov):
   # print(the,obs, cov)
   #return -0.5*(delta**2/cov + np.log(cov))
 
-# !pip install emcee corner
-import emcee
-import corner
 
 def cosmology(w0,wa,Omega_m,omega_b,h,z):
   cosmo=Cosmology(w0_fld=w0,wa_fld=wa,Omega_m=Omega_m,omega_b=omega_b, h=h)
@@ -111,19 +91,21 @@ def loglike_cosmo_desi(theory, obs, cov, z): #cosmological parameters, only desi
 
 
 # Initialize in a ball around some nominal value, sigmas=0
-with Pool() as pool:
-  nwalkers=20
-  ndim=6
-  sampler = emcee.EnsembleSampler(nwalkers, ndim, loglike_cosmo_desi,pool=pool,args=[(alpha_desi_z.T[1]),covariance_desi,alpha_desi_z_eff])
-  p0 = emcee.utils.sample_ball(np.array([-1, 0, 0.7, 0.3, 0.02, 1.0]), np.array([0.1, 0.1, 0.1, 0.01, 0.001, 0.5]), size=nwalkers)
+def main():
+  with Pool() as pool:
+    nwalkers=20
+    ndim=6
+    sampler = emcee.EnsembleSampler(nwalkers, ndim, loglike_cosmo_desi,pool=pool,args=[(alpha_desi_z.T[1]),covariance_desi,alpha_desi_z_eff])
+    p0 = emcee.utils.sample_ball(np.array([-1, 0, 0.7, 0.3, 0.02, 1.0]), np.array([0.1, 0.1, 0.1, 0.01, 0.001, 0.5]), size=nwalkers)
   # Run the sampler... this will take about 15 seconds for 500 steps.
-  start = time.time()
-  pos, prob, state = sampler.run_mcmc(p0, 5000, progress=True)
-  end = time.time()
-  multi_time = end - start
-  print("Multiprocessing took {0:.1f} seconds".format(multi_time))
-  # Throw away the first 50 samples
-
-  chain_desi = sampler.flatchain[500:,:]
-  np.save("MC_desi_sigmas_10_5000.npy", chain)  # Save in NumPy binary format
-  np.savetxt("MC_desi_sigmas_10_5000.txt", chain)  # Save as a text file
+    start = time.time()
+    pos, prob, state = sampler.run_mcmc(p0, 5000, progress=True)
+    end = time.time()
+    multi_time = end - start
+    print("Multiprocessing took {0:.1f} seconds".format(multi_time))
+	  # Throw away the first 50 samples
+    chain_desi = sampler.flatchain[500:,:]
+    np.save("MC_desi_sigmas_10_5000.npy", chain)  # Save in NumPy binary format
+    np.savetxt("MC_desi_sigmas_10_5000.txt", chain)  # Save as a text file
+if __name__ == '__main__':
+  main()
