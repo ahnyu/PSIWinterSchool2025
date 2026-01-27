@@ -3,6 +3,8 @@ import numpy as np
 import argparse
 import multiprocessing as mp
 from multiprocessing import Pool
+import time
+
 
 # Ensure friendly behavior of OpenMP and multiprocessing
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -16,6 +18,69 @@ from scipy.stats import uniform, norm
 from bao import BAOLikelihood
 from cmb import CMBCompressedLikelihood
 from desilike.likelihoods.supernovae import Union3SNLikelihood, PantheonPlusSNLikelihood, DESY5SNLikelihood
+
+_SN_INSTANCE = None
+_SN_CLASS = None
+
+def _get_sn_instance(sn_like_cls, cosmo):
+    """
+    Lazily construct the SN likelihood once per process, then reuse it.
+    We update the cosmology handle each call (best-effort).
+    """
+    global _SN_INSTANCE, _SN_CLASS
+
+    if sn_like_cls is None:
+        return None
+
+    # (Re)create if first time or class changed
+    if _SN_INSTANCE is None or (_SN_CLASS is not sn_like_cls):
+        _SN_INSTANCE = sn_like_cls(cosmo=cosmo)
+        _SN_CLASS = sn_like_cls
+        return _SN_INSTANCE
+
+    # Update cosmology in-place (best-effort)
+    _SN_INSTANCE.cosmo = cosmo
+
+    return _SN_INSTANCE
+
+
+def benchmark_likelihood(ncall, bounds, model, bao_like, bao_sys, cmb_like, sn_like, seed=0):
+    """
+    Simple benchmark: draw params uniformly in bounds and time ncall evaluations.
+    Prints total time, avg time per call, and acceptance rate (finite loglike).
+    """
+    rng = np.random.default_rng(seed)
+    bounds = np.asarray(bounds, dtype=float)
+    lo, hi = bounds[:, 0], bounds[:, 1]
+    width = hi - lo
+
+    # small warmup (loads tables / first CAMB calls etc.)
+    for _ in range(10):
+        p = lo + width * rng.random(size=lo.size)
+        _ = total_log_likelihood(p, model, bao_like=bao_like, bao_sys=bao_sys,
+                                 cmb_like=cmb_like, sn_like=sn_like)
+
+    t0 = time.perf_counter()
+    n_finite = 0
+    n_inf = 0
+    for _ in range(ncall):
+        p = lo + width * rng.random(size=lo.size)
+        ll = total_log_likelihood(p, model, bao_like=bao_like, bao_sys=bao_sys,
+                                  cmb_like=cmb_like, sn_like=sn_like)
+        if np.isfinite(ll):
+            n_finite += 1
+        else:
+            n_inf += 1
+    dt = time.perf_counter() - t0
+
+    avg = dt / ncall
+    print("\n=== Likelihood benchmark ===")
+    print(f"ncall = {ncall}")
+    print(f"total time = {dt:.3f} s")
+    print(f"avg per call = {avg:.6f} s  ({1.0/avg:.2f} calls/s)")
+    print(f"finite = {n_finite}  (-inf/NaN = {n_inf})  accept rate = {n_finite/ncall:.3f}")
+    print("=== End benchmark ===\n")
+
 
 def build_bounds(model, include_bao, bao_sys, include_sn, sn_likelihood):
     """
@@ -55,73 +120,64 @@ def prepPrior(bounds, bbn=None, bbnidx=3):
     return pc.Prior(dists)
 
 def total_log_likelihood(params, model, bao_like=None, bao_sys=False, cmb_like=None, sn_like=None):
-    """
-    Combined likelihood for the chosen probes.
-    """
     idx = 0
+    params = np.asarray(params, dtype=float)
+
     if model == 'w0waCDM':
-        if len(params) < 5:
-            return -np.inf
-        w0, wa, Omega_m, omega_b, h = params[idx:idx+5]
-        idx += 5
+        if params.size < 5: return -np.inf
+        w0, wa, Omega_m, omega_b, h = params[idx:idx+5]; idx += 5
     elif model == 'LCDM':
-        if len(params) < 3:
-            return -np.inf
-        Omega_m, omega_b, h = params[idx:idx+3]
+        if params.size < 3: return -np.inf
+        Omega_m, omega_b, h = params[idx:idx+3]; idx += 3
         w0, wa = -1.0, 0.0
-        idx += 3
     else:
         raise ValueError("Unknown cosmological model.")
 
-    # Enforce physical priors
-    if (w0 + wa) >= 0:
+    if (w0 + wa) >= 0.0:
         return -np.inf
-    if (Omega_m * h**2) <= omega_b+0.0006441915396177796:
+    omega_nu = 0.0006441915396177796  # ~ 0.06/93.14
+    if (Omega_m * h**2) <= (omega_b + omega_nu):
         return -np.inf
 
-    # Create a new Cosmology instance with the sampled parameters.
-    cosmo = Cosmology(w0_fld=w0, wa_fld=wa, Omega_m=Omega_m, omega_b=omega_b, h=h,mnu=0.06,nnu=3.044)
-    cosmo.set_engine('camb')
-    
-    total_ll = 0.0
+    try:
+        cosmo = Cosmology(w0_fld=w0, wa_fld=wa, Omega_m=Omega_m, omega_b=omega_b, h=h, mnu=0.06, nnu=3.044)
+        cosmo.set_engine('camb')
 
-    # Update BAO likelihood model with the new cosmo.
-    if bao_like is not None:
-        bao_like.model.cosmo = cosmo
-        if bao_sys:
+        total_ll = 0.0
+
+        if bao_like is not None:
+            bao_like.model.cosmo = cosmo
+            if bao_sys:
+                if idx >= params.size: return -np.inf
+                s = params[idx]; idx += 1
+                ll_bao = bao_like.calculate(sys_coeff=s)
+            else:
+                ll_bao = bao_like.calculate()
+            if not np.isfinite(ll_bao): return -np.inf
+            total_ll += ll_bao
+
+        if cmb_like is not None:
+            cmb_like.model = cosmo
+            ll_cmb = cmb_like.calculate()
+            if not np.isfinite(ll_cmb): return -np.inf
+            total_ll += ll_cmb
+
+        if sn_like is not None:
             if idx >= len(params):
                 return -np.inf
-            bao_nuis = params[idx]
-            idx += 1
-            ll_bao = bao_like.calculate(sys_coeff=bao_nuis)
-        else:
-            ll_bao = bao_like.calculate()
-        total_ll += ll_bao
-        if total_ll == -np.inf:
-            return -np.inf
+            sn_nuis = params[idx]
+            idx += 1    
+            sn_instance = _get_sn_instance(sn_like, cosmo)
+            sn_instance.calculate(sn_nuis)
+            ll_sn = sn_instance.loglikelihood
+            if not np.isfinite(ll_sn):
+                return -np.inf
+            total_ll += ll_sn
 
-    # Update CMB likelihood model with the new cosmo.
-    if cmb_like is not None:
-        cmb_like.model = cosmo
-        ll_cmb = cmb_like.calculate()
-        total_ll += ll_cmb
-        if total_ll == -np.inf:
-            return -np.inf
+        return float(total_ll)
 
-    # SN likelihood: create an instance using the shared cosmo and calculate.
-    if sn_like is not None:
-        if idx >= len(params):
-            return -np.inf
-        sn_nuis = params[idx]
-        idx += 1
-        sn_instance = sn_like(cosmo=cosmo)
-        sn_instance.calculate(dM=sn_nuis)
-        ll_sn = sn_instance.loglikelihood
-        total_ll += ll_sn
-        if total_ll == -np.inf:
-            return -np.inf
-
-    return total_ll
+    except Exception:
+        return -np.inf
 
 def main(args):
     
@@ -158,6 +214,21 @@ def main(args):
     
     # Build priors
     bounds = build_bounds(model, include_bao, args.bao_sys, include_sn, args.sn_likelihood)
+
+    if args.benchmark:
+        benchmark_likelihood(
+            ncall=1000,
+            bounds=bounds,
+            model=model,
+            bao_like=bao_like,
+            bao_sys=args.bao_sys,
+            cmb_like=cmb_like,
+            sn_like=sn_like,
+            seed=0,
+        )
+        return
+
+    
     if include_cmb:
         prior = prepPrior(bounds)
     else:
@@ -214,5 +285,7 @@ if __name__ == '__main__':
                         help="Label for the output chain file")
     parser.add_argument("--ncores", type=int, default=16,
                         help="Number of cores to use for parallel processing")
+    parser.add_argument("--benchmark", action="store_true",
+                    help="Benchmark: run 1000 likelihood evaluations and exit")
     args = parser.parse_args()
     main(args)

@@ -1,6 +1,6 @@
 import numpy as np
 from cosmoprimo import Cosmology
-from scipy.linalg import block_diag
+from scipy.linalg import cho_factor, cho_solve
 
 # Speed of light in km/s
 c_l_kms = 299792.458
@@ -30,82 +30,78 @@ class BAOCosmology:
         return (z * DM**2 * DH)**(1.0/3.0)
 
 class BAOLikelihood:
-    # Class-level cache for BAO data; loaded only once per dataset.
     _data_loaded = {}
     _data = {}
 
     @classmethod
     def load_default_data(cls, data_dir=".", dataset="DESI"):
-        """
-        Load BAO data        
-        For dataset 'DESI', loads from "DESI_bao_data.npz".
-        For dataset 'DESI_SDSS', loads from "DESI_SDSS_bao_data.npz".
-        """
-        # Check if already loaded for this dataset.
-        if dataset in cls._data_loaded and cls._data_loaded[dataset]:
+        key = dataset.upper()
+        if cls._data_loaded.get(key, False):
             return
-
-        if dataset.upper() == "DESI":
+        if key == "DESI":
             filename = f"{data_dir}/DESI_bao_data.npz"
-        elif dataset.upper() == "DESI_SDSS":
+        elif key == "DESI_SDSS":
             filename = f"{data_dir}/DESI_SDSS_bao_data.npz"
         else:
             raise ValueError("Invalid dataset. Use 'DESI' or 'DESI_SDSS'.")
-        
         loaded = np.load(filename, allow_pickle=True)
-        cls._data[dataset] = {
-            "data_vector": loaded["data"],
-            "covmat": loaded["cov"],
-            "redshifts": loaded["zeff"],
-            "types": loaded["types"]
-        }
-        cls._data_loaded[dataset] = True
+        cls._data[key] = dict(
+            data_vector=np.asarray(loaded["data"], dtype=float),
+            covmat=np.asarray(loaded["cov"], dtype=float),
+            redshifts=np.asarray(loaded["zeff"], dtype=float),
+            types=np.asarray(loaded["types"]).astype(str),
+        )
+        cls._data_loaded[key] = True
 
-    def __init__(self, cosmo=None, data_dir="bao_data", dataset="DESI", engine='camb'):
-        BAOLikelihood.load_default_data(data_dir=data_dir, dataset=dataset)
-        data = BAOLikelihood._data[dataset]
+    def __init__(self, cosmo=None, data_dir="bao_data", dataset="DESI", engine="camb"):
+        self.load_default_data(data_dir=data_dir, dataset=dataset)
+        data = self._data[dataset.upper()]
+
         self.data_vector = data["data_vector"]
         self.covmat = data["covmat"]
         self.redshifts = data["redshifts"]
         self.types = data["types"]
+
+        # Precompute type and indices
+        self._idx = {t: np.where(self.types == t)[0] for t in np.unique(self.types)}
+        self.ndata = self.data_vector.size
+
+        # Precompute Cholesky and logdet(C)
+        self._cho = cho_factor(self.covmat, lower=True, check_finite=False)
+        L = self._cho[0]
+        self._logdetC = 2.0 * np.sum(np.log(np.diag(L)))
+
         if cosmo is not None:
-            if not hasattr(cosmo, "compute_DMoverRs"):
-                self.model = BAOCosmology(cosmo=cosmo, engine=engine)
-            else:
-                self.model = cosmo
+            self.model = cosmo if hasattr(cosmo, "compute_DMoverRs") else BAOCosmology(cosmo=cosmo, engine=engine)
         else:
             self.model = BAOCosmology(engine=engine)
-        self.loglikelihood = None
 
-    def calculate(self, sys_coeff=None):
-        """
-        Compute the BAO log-likelihood.        
-        If sys_coeff is provided, scales the covariance matrix to account for systematics.
-        """
-        theory_vector = np.empty_like(self.data_vector, dtype=float)
-        for typ in np.unique(self.types):
-            indices = np.where(self.types == typ)[0]
-            z_vals = self.redshifts[indices]
+    def _theory_vector(self):
+        th = np.empty_like(self.data_vector, dtype=float)
+        for typ, inds in self._idx.items():
+            z = self.redshifts[inds]
             if typ == "DM_over_rs":
-                theory_vals = self.model.compute_DMoverRs(z_vals)
+                th[inds] = self.model.compute_DMoverRs(z)
             elif typ == "DH_over_rs":
-                theory_vals = self.model.compute_DHoverRs(z_vals)
+                th[inds] = self.model.compute_DHoverRs(z)
             elif typ == "DV_over_rs":
-                theory_vals = self.model.compute_DVoverRs(z_vals)
+                th[inds] = self.model.compute_DVoverRs(z)
             else:
                 raise ValueError(f"Invalid observable type: {typ}")
-            theory_vector[indices] = theory_vals
+        return th
+
+    def calculate(self, sys_coeff=None):
+        th = self._theory_vector()
+        delta = self.data_vector - th
+
+        chi2_0 = float(delta @ cho_solve(self._cho, delta, check_finite=False))
 
         if sys_coeff is None:
-            delta = self.data_vector - theory_vector
-            inv_cov = np.linalg.inv(self.covmat)
-            chi2 = delta.T @ inv_cov @ delta
-            self.loglikelihood = -0.5 * chi2
-        else:
-            new_cov = sys_coeff * self.covmat
-            inv_cov = np.linalg.inv(new_cov)
-            logdet = np.log(np.linalg.det(new_cov))
-            delta = self.data_vector - theory_vector
-            chi2 = delta.T @ inv_cov @ delta
-            self.loglikelihood = -0.5 * (chi2 + logdet)
-        return self.loglikelihood
+            return -0.5 * chi2_0
+        s = float(sys_coeff)
+        if not np.isfinite(s) or s <= 0.0:
+            return -np.inf
+
+        chi2 = chi2_0 / s
+        logdet = self._logdetC + self.ndata * np.log(s)
+        return -0.5 * (chi2 + logdet)
